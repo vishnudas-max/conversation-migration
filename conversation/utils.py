@@ -1,11 +1,13 @@
 import requests
 from django.conf import settings
 from requests.exceptions import RequestException
-from .models import cercuscontact,inkadmincontact,cfieldmapping
+from .models import cercuscontact, conversation,inkadmincontact,cfieldmapping
 import phonenumbers
 import pycountry
 from django.db import transaction
 from django.db.models import Q
+from django.shortcuts import get_object_or_404
+
 
 
 def country_name_to_code(country_name):
@@ -24,161 +26,124 @@ def normalize_phone(phone):
         # If parsing fails, return as is
         return phone
 
+def get_cf_value(cf_list, wanted_id):
+    """Return the value for the custom field with id=wanted_id (supports 'value' or 'field_value')."""
+    if not cf_list:
+        return None
+    wanted_id = str(wanted_id)
+    for cf in cf_list:
+        if str(cf.get("id")) == wanted_id:
+            return cf.get("value", cf.get("field_value"))
+    return None
 
-def add_contacts_to_db(ghlcontacts, locationId,is_cercus):
-    # Get the GHLAccessToken instance for the location
-
+def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
+    inkadmin_link_cfield_id=settings.CFILED_ID
 
     contacts_to_create = []
     contacts_to_update = []
-    emails_to_create = []
-    phones_to_create = []
 
-    # Get existing contacts in one query for efficiency
-    contact_ids = [str(contact.get('id')) for contact in ghlcontacts]
+    # Build list of contact ids from API
+    contact_ids = [str(c.get("id")) for c in ghlcontacts if c.get("id")]
 
-
+    # Fetch existing by location + ids
     if is_cercus:
         existing_contacts = {
-            contact.contact_id: contact
-            for contact in cercuscontact.objects.filter(locationId=locationId, contact_id__in=contact_ids)
+            c.contact_id: c
+            for c in cercuscontact.objects.filter(locationId=locationId, contact_id__in=contact_ids)
         }
     else:
         existing_contacts = {
-            contact.contact_id: contact
-            for contact in inkadmincontact.objects.filter(locationId=locationId, contact_id__in=contact_ids)
+            c.contact_id: c
+            for c in inkadmincontact.objects.filter(locationId=locationId, contact_id__in=contact_ids)
         }
 
-  
-    seen_ids=set()
-    for contact in ghlcontacts:
-        contact_id = str(contact.get('id'))
-        if contact_id in seen_ids:
+    # If this is Cercus data and we have the link field id, pre-collect all referenced InkAdmin IDs
+    inkadmin_id_by_cercus_id = {}  # cercus_contact_id -> inkadmin_contact_id
+    inkadmin_ids_needed = set()
+
+    if is_cercus and inkadmin_link_cfield_id:
+        for c in ghlcontacts:
+            cid = str(c.get("id") or "")
+
+            if not cid:
+                continue
+
+            link_val = get_cf_value(c.get("customFields"), inkadmin_link_cfield_id)
+
+            if link_val:
+                link_val = str(link_val)
+                inkadmin_id_by_cercus_id[cid] = link_val
+                inkadmin_ids_needed.add(link_val)
+
+    # Prefetch InkAdmin contacts referenced by custom field
+    inkadmin_lookup = {}
+    if is_cercus and inkadmin_ids_needed:
+        q = Q(contact_id__in=inkadmin_ids_needed)
+        inkadmin_lookup = {x.contact_id: x for x in inkadmincontact.objects.filter(q)}
+
+    seen_ids = set()
+    for c in ghlcontacts:
+        contact_id = str(c.get("id") or "")
+        if not contact_id or contact_id in seen_ids:
             continue
         seen_ids.add(contact_id)
-        first_name = contact.get('firstNameLowerCase')
-        last_name = contact.get('lastNameLowerCase')
-        email = contact.get('email')
-        not_parsed_phone = contact.get('phone')
-        if not_parsed_phone:
-            phone = normalize_phone(not_parsed_phone)
-        else:
-            phone = None
-        city = contact.get('city')
-        state = contact.get('state')
-        zip_code = contact.get('postalCode')
-        
-        country_fullname = contact.get('country')
-        country = None
-        if country_fullname:
-            country = country_name_to_code(country_fullname)
 
-        street = contact.get('address')
-        source_modified_on_str = contact.get('dateUpdated')
-        
+        existing = existing_contacts.get(contact_id)
 
-        # Extra emails/phones (excluding the primary)
-        additionalEmailobj =contact.get('additionalEmails')
-        additionalPhoneobj =contact.get('additionalPhones')
-        # extra_emails = extract_email_values(additionalEmailobj,email) #extract the email wethere it's array of object or array of values
-        # extra_phones = extract_phone_values(additionalPhoneobj,email)
-        
-        existing_contact = existing_contacts.get(contact_id)
+        # If this is a Cercus contact, try to find linked InkAdmin contact via custom field
+        linked_inkadmin_obj = None
 
-        if existing_contact:
-            # Check if source data has been modified since last sync
-                # Update all fields since source data has changed
-                existing_contact.first_name = first_name
-                existing_contact.last_name = last_name
-                existing_contact.email = email
-                existing_contact.phone = phone                
-                contacts_to_update.append(existing_contact)
+        if is_cercus and inkadmin_link_cfield_id:
+            linked_inkadmin_id = inkadmin_id_by_cercus_id.get(contact_id)
+            if linked_inkadmin_id:
+                linked_inkadmin_obj = inkadmin_lookup.get(linked_inkadmin_id)
 
-                # # Remove old extra emails/phones and add new ones
-                # existing_contact.extra_emails.all().delete()
-                # existing_contact.extra_phones.all().delete()
-                
-                # for e in extra_emails:
-                #     emails_to_create.append(GHLEmail(ghlcontact=existing_contact, email=e))
-                    
-                # for p in extra_phones:
-                #     phones_to_create.append(GHLPhone(ghlcontact=existing_contact, phone=p))
-        else:
-            # New contact
+        if existing:
             if is_cercus:
-                new_contact = cercuscontact(
+                existing.inkadmin_contact = linked_inkadmin_obj
+            contacts_to_update.append(existing)
+        else:
+            # Create new
+            if is_cercus:
+                new_obj = cercuscontact(
                     contact_id=contact_id,
-                    first_name=first_name,
-                    last_name=last_name,
-                    email=email,
-                    phone=phone,
                     locationId=locationId,
+                    inkadmin_contact=linked_inkadmin_obj,
                 )
-                contacts_to_create.append((new_contact))
             else:
-                new_contact = inkadmincontact(
+                new_obj = inkadmincontact(
                     contact_id=contact_id,
-                    first_name=first_name,
-                    last_name=last_name,
-                    email=email,
-                    phone=phone,
                     locationId=locationId,
                 )
-                contacts_to_create.append((new_contact))
+            contacts_to_create.append(new_obj)
 
     try:
-        total_processed = 0
-        total_created = 0
-        total_updated =0
         with transaction.atomic():
-            # Create new contacts in bulk
+            total_created = total_updated = 0
+
             if contacts_to_create:
                 if is_cercus:
                     cercuscontact.objects.bulk_create(contacts_to_create, batch_size=500)
                 else:
                     inkadmincontact.objects.bulk_create(contacts_to_create, batch_size=500)
-
                 total_created = len(contacts_to_create)
-                total_processed += total_created
-    
-                
-            # Bulk update contacts
+
             if contacts_to_update:
+                fields = []
+
                 if is_cercus:
-                    cercuscontact.objects.bulk_update(
-                        contacts_to_update,
-                        ['first_name', 'last_name', 'email', 'phone'],
-                        batch_size=500
-                    )
+                    fields.append("inkadmin_contact")
+                if is_cercus:
+                    cercuscontact.objects.bulk_update(contacts_to_update, fields, batch_size=500)
                 else:
-                    inkadmincontact.objects.bulk_update(
-                        contacts_to_update,
-                        ['first_name', 'last_name', 'email', 'phone'],
-                        batch_size=500
-                    )
-
+                    inkadmincontact.objects.bulk_update(contacts_to_update, fields, batch_size=500)
                 total_updated = len(contacts_to_update)
-                total_processed += total_updated
-           
 
-
-            # Bulk create emails and phones
-            # if emails_to_create:
-            #     GHLEmail.objects.bulk_create(emails_to_create, batch_size=500)
-            # if phones_to_create:
-            #     GHLPhone.objects.bulk_create(phones_to_create, batch_size=500)
-
-
-            # GHLContact.objects.filter(location=ghlLocation,contact_id__in=contact_ids).update(is_active=True)
-
-        
-        return total_processed,total_created,total_updated
+        return (total_created + total_updated), total_created, total_updated
 
     except Exception as e:
         print(f"Failed to save GHL contacts: {e}")
-        raise e
-    
-
+        raise
 
 
 
@@ -307,7 +272,6 @@ def get_cercus_inkadmin_contact_cfieldid() -> str | None:
         settings.CERCUS_GHL_ACCESS_TOKEN,
         settings.GHL_API_VERSION,
     )
-   
     if isinstance(c_fields, dict):
         return c_fields.get("InkAdmin Contact ID")
     
@@ -397,36 +361,65 @@ def create_contact(contact_data: dict, location_id: str, access_token: str) -> d
     # return data.get("contact", data)
 
 
-def map_contacts():
-    inkadmin_contacts = inkadmincontact.objects.all()
-    created = 0
-    for contact in inkadmin_contacts:
-        email = (contact.email).strip() if contact.email else None
-        phone = (contact.phone).strip() if contact.phone else None
-        fname = (contact.first_name).strip() if contact.first_name else None
-        lname = (contact.last_name).strip() if contact.last_name else None
-        # name = (f"{fname} {lname}").strip()
-        ccontact = None
-        if email or phone:
-            ccontact = cercuscontact.objects.filter(Q(email=email) | Q(phone=phone)).first()
-        else:
-            ccontact = cercuscontact.objects.filter(first_name=fname,last_name=lname).first()
-        
-        if ccontact:
-            contact.cercuscontact = ccontact 
-            contact.save()
 
-        if not ccontact:
-            contact_detailes = get_contact(settings.INKA_LOCATION_ID, settings.INKA_GHL_ACCESS_TOKEN, contact.contact_id)
-            if not contact_detailes:
-                print(f"Contact {contact.contact_id} not found in GHL")
-            
-            is_created = create_contact(contact_detailes,settings.CERCUS_LOCATION_ID,settings.CERCUS_GHL_ACCESS_TOKEN)
-            if is_created:
-                created += 1
-                print(f"Contact {contact.contact_id} created in GHL")
-                
-    print(f"Total contacts created in GHL: {created}")
+# Consider removing the decorator or scoping atomic to just the DB write
+# @transaction.atomic
+def map_contacts():
+    created = updated = 0
+
+    inkadmin_contacts = (
+        inkadmincontact.objects
+        .filter(cercus_contacts__isnull=True)   # not linked to any Cercus contact yet
+        .exclude(contact_id__in=[None, ""])
+        .distinct()
+        .iterator()
+    )
+
+    for contact in inkadmin_contacts:
+      
+        details = get_contact(
+            settings.INKA_LOCATION_ID,
+            settings.INKA_GHL_ACCESS_TOKEN,
+            contact.contact_id,
+        )
+        if not details:
+            print(f"Contact {contact.contact_id} not found in InkAdmin; skipping")
+            continue
+
+        try:
+            resp = create_contact(
+                details,
+                settings.CERCUS_LOCATION_ID,
+                settings.CERCUS_GHL_ACCESS_TOKEN,
+            )
+        except Exception as e:
+            print(f"Create failed for {contact.contact_id}: {e}")
+            continue
+        if resp:
+            created +=1
+        # contact = resp
+        # new_id = str(contact.get("id") or "")
+        # if not new_id:
+        #     print(f"Create failed for {contact.contact_id}; bad response: {resp}")
+        #     continue
+
+
+        # with transaction.atomic():
+        #     cc, was_created = cercuscontact.objects.update_or_create(
+        #         contact_id=new_id,
+        #         defaults={
+        #             "locationId": settings.CERCUS_LOCATION_ID,
+        #             "is_newly_created": True,
+        #             "inkadmin_contact": contact,
+        #         },
+        #     )
+        # if was_created:
+        #     created += 1
+        # else:
+        #     updated += 1
+
+    print(f"created={created}, total_processed={created+updated}")
+
 
 def fetch_custom_fields(location_id: str, token: str, version: str) -> dict[str, str]:
     url = f"https://services.leadconnectorhq.com/locations/{location_id}/customFields"
@@ -490,3 +483,504 @@ def mapcustomFields():
 
 
 
+
+
+
+
+# -------------------------------------------conversation part------------------------------------------------------
+
+
+def add_conversations_to_db_inka(conversations_batch, location_id):
+
+    from .models import conversation, inkadmincontact  
+
+    to_create = []
+    to_update = []
+
+    # Dedup batch by conversation id
+    seen = set()
+    conv_ids = []
+    contact_ids = set()
+
+    for conv in conversations_batch:
+
+        cid = str(conv.get("id") or "")
+
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        conv_ids.append(cid)
+        if conv.get("contactId"):
+            contact_ids.add(str(conv["contactId"]))
+
+    # Prefetch existing convs and inkadmin contacts
+    existing_convs = {
+        obj.i_conversation_id: obj
+        for obj in conversation.objects.filter(i_conversation_id__in=conv_ids)
+    }
+
+    ink_lookup = {
+        ic.contact_id: ic
+        for ic in inkadmincontact.objects.filter(
+            locationId=location_id, contact_id__in=contact_ids
+        )
+    }
+
+    for conv in conversations_batch:
+        conv_id = str(conv.get("id") or "")
+
+        if not conv_id or conv_id not in seen:
+            continue  
+
+        ink_contact = ink_lookup.get(str(conv.get("contactId") or ""))
+        ink_contact_id = str(conv.get("contactId") or "")
+
+        existing = existing_convs.get(conv_id)
+
+        if existing:
+            if existing.i_contact.contact_id != ink_contact_id:
+                existing.i_contact = ink_contact
+                to_update.append(existing)
+        else:
+            to_create.append(
+                conversation(
+                    i_conversation_id=conv_id,
+                    i_contact=ink_contact,
+                    # c_* fields left None
+                )
+            )
+
+    created = updated = 0
+    with transaction.atomic():
+        if to_create:
+            conversation.objects.bulk_create(to_create, batch_size=500)
+            created = len(to_create)
+        if to_update:
+            conversation.objects.bulk_update(to_update, ["i_contact"], batch_size=500)
+            updated = len(to_update)
+
+    return created, updated
+
+def update_conversations_with_cercus(conversations_batch, location_id):
+    from .models import conversation, cercuscontact  
+    print("started")
+    to_update = []
+
+    # Step 1: Collect all convo + contact IDs
+    seen, conv_ids, contact_ids = set(), [], set()
+    for conv in conversations_batch:
+        cid = str(conv.get("id") or "")
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        conv_ids.append(cid)
+        if conv.get("contactId"):
+            contact_ids.add(str(conv["contactId"]))
+
+    # Step 2: Prefetch Cercus contacts with mapping
+    cercus_contacts = {
+        c.contact_id: c
+        for c in cercuscontact.objects.select_related("inkadmin_contact").filter(
+            contact_id__in=contact_ids
+        )
+    }
+
+    # Step 3: Prefetch Inka-side conversations for mapped contacts
+    inka_contact_ids = [c.inkadmin_contact.contact_id for c in cercus_contacts.values() if c.inkadmin_contact]
+    inka_convs = conversation.objects.filter(i_contact__contact_id__in=inka_contact_ids)
+    inka_convs_lookup = {conv.i_contact.contact_id: conv for conv in inka_convs}
+
+    # Step 4: Process updates only
+    for conv in conversations_batch:
+        conv_id = str(conv.get("id") or "")
+        if not conv_id or conv_id not in seen:
+            continue  
+
+        cercus_contact = cercus_contacts.get(str(conv.get("contactId") or ""))
+
+        if not cercus_contact or not cercus_contact.inkadmin_contact:
+            continue  
+
+        existing = inka_convs_lookup.get(cercus_contact.inkadmin_contact.contact_id)
+
+        if existing:
+            existing.c_contact = cercus_contact
+            existing.c_conversation_id = conv_id
+            to_update.append(existing)
+
+    updated = 0
+    with transaction.atomic():
+        if to_update:
+            conversation.objects.bulk_update(to_update, ["c_contact", "c_conversation_id"], batch_size=500)
+            updated = len(to_update)
+
+    return updated
+
+
+
+def fetch_inkadmin_conversations():
+    location_id = settings.INKA_LOCATION_ID
+    access_token = settings.INKA_GHL_ACCESS_TOKEN
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Version": settings.GHL_API_VERSION,
+    }
+
+    url = "https://services.leadconnectorhq.com/conversations/search"
+    limit = 100
+
+    total_fetched = 0
+    total_created = 0
+    total_updated = 0
+
+    startAfterDate = None
+    print("Fetching and processing conversations...")
+
+    try:
+        while True:
+            params = {
+                "locationId": location_id,
+                "limit": limit,
+                "sortBy":"last_message_date",
+                "sort":"asc"
+            }
+            if startAfterDate:
+                params["startAfterDate"] = startAfterDate
+
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            batch = data.get("conversations", []) or []
+            fetched = len(batch)
+            total_fetched += fetched
+
+            if not batch:
+                break
+
+            # Process this page
+            try:
+                batch_created, batch_updated = add_conversations_to_db_inka(batch, location_id)
+                total_created += batch_created
+                total_updated += batch_updated
+            except Exception as e:
+                print(f"Error processing batch: {e}")
+
+            # Advance cursor using the largest dateAdded in the batch
+            dates = [c.get("lastMessageDate") for c in batch if c.get("lastMessageDate") is not None]
+            new_cursor = max(dates) if dates else None
+
+            # Stop if fewer than a full page OR cursor didn't advance
+            if fetched < limit or not new_cursor or new_cursor == startAfterDate:
+                break
+            startAfterDate = new_cursor
+
+    except RequestException as e:
+        print(f"Error fetching conversations: {e}")
+        # Optional: inspect last response body if available
+        try:
+            print(resp.text)  # may not exist on first-iteration failures
+        except Exception:
+            pass
+
+    summary = {
+        "fetched": total_fetched,
+        "created": total_created,
+        "updated": total_updated,
+        "processed": total_created + total_updated,
+    }
+    print(f"Done. {summary}")
+    return summary
+
+def fetch_cercus_conversations():
+    location_id = settings.CERCUS_LOCATION_ID
+    access_token = settings.CERCUS_GHL_ACCESS_TOKEN
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Version": settings.GHL_API_VERSION,
+    }
+
+    url = "https://services.leadconnectorhq.com/conversations/search"
+    limit = 100
+
+    total_fetched = 0
+    total_created = 0
+    total_updated = 0
+
+    startAfterDate = None
+    print("Fetching and processing conversations...")
+
+    try:
+        while True:
+            params = {
+                "locationId": location_id,
+                "limit": limit,
+                "sortBy":"last_message_date",
+                "sort":"asc"
+            }
+            if startAfterDate:
+                params["startAfterDate"] = startAfterDate
+
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            batch = data.get("conversations", []) or []
+            fetched = len(batch)
+            total_fetched += fetched
+
+            if not batch:
+                break
+
+            # Process this page
+            try:
+                batch_updated = update_conversations_with_cercus(batch, location_id)
+                total_updated += batch_updated
+            except Exception as e:
+                print(f"Error processing batch: {e}")
+
+            # Advance cursor using the largest dateAdded in the batch
+            dates = [c.get("lastMessageDate") for c in batch if c.get("lastMessageDate") is not None]
+            new_cursor = max(dates) if dates else None
+
+            # Stop if fewer than a full page OR cursor didn't advance
+            if fetched < limit or not new_cursor or new_cursor == startAfterDate:
+                break
+            startAfterDate = new_cursor
+
+    except RequestException as e:
+        print(f"Error fetching conversations: {e}")
+        # Optional: inspect last response body if available
+        try:
+            print(resp.text)  # may not exist on first-iteration failures
+        except Exception:
+            pass
+
+    summary = {
+        "fetched": total_fetched,
+        "updated": total_updated,
+        "processed": total_created + total_updated,
+    }
+    print(f"Done. {summary}")
+    return summary
+
+
+
+
+def create_conversation_for_contact(i_contact_id,i_conversation_id):
+
+    # Step 1: Find the inkadmin contact
+    i_contact = get_object_or_404(inkadmincontact, contact_id=i_contact_id)
+
+    # Step 2: Find mapped cercus contact
+    c_contact = getattr(i_contact, "cercus_contacts", None)
+    
+    if not c_contact:
+        print(f"{i_contact_id} has no mapped cercus contact; cannot create conversation")
+        return False,None
+
+
+
+    url = "https://services.leadconnectorhq.com/conversations/"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}",
+    }
+
+    payload = {
+        "locationId": settings.CERCUS_LOCATION_ID,  # from settings
+        "contactId": c_contact.contact_id,
+    }
+
+    # Step 4: Make request
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        c_conversation = data.get("conversation", {})
+        c_conversation_id = c_conversation.get("id")
+        c_contact_id = c_conversation.get("contactId")
+
+        if not c_conversation_id or not c_contact_id:
+            print(f"Failed to create conversation for contact {i_contact_id}: {data}")
+            return False,None
+        
+        conv=conversation.objects.filter(i_contact=i_contact, i_conversation_id=i_conversation_id).first()
+        conv.c_contact=c_contact
+        conv.c_conversation_id=c_conversation_id
+        conv.save()
+    
+        
+    except requests.RequestException as e:
+        print(f"Error creating conversation for contact {i_contact_id}: {e}")
+        print(response.text if 'response' in locals() else "No response object")
+        return False,None
+
+    return True,c_conversation_id
+
+
+def _deep_get(d, path, default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
+
+
+def build_create_message_payload(msg,conv_id):
+
+    conversation_provider ="68a619d8a3f9a7912b382a9a"
+
+    raw_type = msg.get("messageType") or ""
+
+    TYPE_MAP = {
+        "TYPE_SMS": "SMS",
+        "TYPE_EMAIL": "Email",
+        "TYPE_WHATSAPP": "WhatsApp",
+        "TYPE_GMB": "GMB",
+        "TYPE_INSTAGRAM": "IG",
+        "TYPE_FACEBOOK": "FB",
+        "TYPE_CALL": "Call",
+        "TYPE_LIVE_CHAT": "Live_Chat"
+    }
+
+
+    msg_type = TYPE_MAP.get(raw_type, None)
+    if msg_type is None:
+        return False,{}
+
+    msg.get()
+    payload = {
+        "type": msg_type,
+        "attachments": msg.get("attachments") or None, 
+        "message": msg.get("body") or None,
+        "conversationId": conv_id, 
+        "conversationProviderId": conversation_provider,
+        "altId": msg.get("altId") or None,
+        "direction": msg.get("direction") or None,     
+        "date": msg.get("dateAdded") or None
+    }
+
+    
+    meta = msg.get("meta", {})
+    emails = meta.get("email", {})
+    emailids= emails.messageIds if emails else []
+    
+    if msg_type == "EMAIL":
+        payload.update({
+            "html": msg.get("html") or None,
+            "subject": msg.get("subject") or None,
+            "emailFrom": msg.get("emailFrom") or None,
+            "emailTo": msg.get("emailTo") or None,
+            "emailCc": msg.get("emailCc") or None,
+            "emailBcc": msg.get("emailBcc") or None,
+            "emailMessageId": (_deep_get(msg, ["meta", "email", "email", "messageIds"], []) or [None])[0],
+        })
+
+    
+    if msg_type == "CALL":
+        # Different responses show call info either at meta.call or split as callDuration/callStatus
+        call_meta = msg.get("meta", {}).get("call") or {}
+        call_status = call_meta.get("status") or msg.get("meta", {}).get("callStatus")
+        call_block = {
+            # 'to' and 'from' are not present in GET samples; omit if unknown
+            "status": call_status or None,
+        }
+        # Only attach "call" when at least something meaningful exists
+        if any(v is not None for v in call_block.values()):
+            payload["call"] = {k: v for k, v in call_block.items() if v is not None}
+
+    # Remove keys with None or empty lists so we don't send irrelevant fields
+    cleaned = {}
+    for k, v in payload.items():
+        if v is None:
+            continue
+        if isinstance(v, (list, dict)) and not v:
+            continue
+        cleaned[k] = v
+
+    return cleaned
+
+
+
+def create_message(msg, c_convId, i_conversation_id):
+    payload = {}
+
+
+
+
+def fetch_messages_for_conversation(conversation_id,):
+
+    location_id = settings.INKA_LOCATION_ID
+    access_token = settings.INKA_GHL_ACCESS_TOKEN
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Version": settings.GHL_API_VERSION,
+    }
+
+    url = f"https://services.leadconnectorhq.com/conversations/{conversation_id}/messages"
+
+    all_messages = []
+    last_message_id = None
+
+    try:
+        while True:
+            params = {"locationId": location_id, "limit": 100}
+            if last_message_id:
+                params["lastMessageId"] = last_message_id
+
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            messages_data = data.get("messages", {})
+            batch = messages_data.get("messages", []) or []
+            all_messages.extend(batch)
+
+            # pagination handling
+            next_page = messages_data.get("nextPage", False)
+            last_message_id = messages_data.get("lastMessageId")
+
+            if not next_page or not last_message_id:
+                break  # no more pages
+
+    except RequestException as e:
+        print(f"Error fetching messages for conversation {conversation_id}: {e}")
+        try:
+            print(resp.text)
+        except Exception:
+            pass
+
+    print(f"Fetched {len(all_messages)} messages for conversation {conversation_id}")
+    return all_messages
+
+
+
+def map_conversations():
+    from .models import conversation
+    conversations = conversation.objects.filter().iterator()
+    created = 0
+    for conv in conversations:
+        i_contact_id = conv.i_contact.contact_id
+        i_conversation_id = conv.i_conversation_id
+        
+
+        try:
+            result = create_conversation_for_contact(i_contact_id, i_conversation_id)
+            conv.refresh_from_db()
+            created += 1
+        except Exception as e:
+            print(f"Error mapping conversation for contact {i_contact_id}: {e}")
+
+        inkmessages,c_convId = fetch_messages_for_conversation(i_conversation_id)
+        for msg in inkmessages:
+            create_message(msg, c_convId, i_conversation_id)

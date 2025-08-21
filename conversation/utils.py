@@ -1,12 +1,13 @@
 import requests
 from django.conf import settings
 from requests.exceptions import RequestException
-from .models import cercuscontact, conversation,inkadmincontact,cfieldmapping
+from .models import cercuscontact, conversation,inkadmincontact,cfieldmapping,i_messages,c_messages
 import phonenumbers
 import pycountry
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
+import os
 
 
 
@@ -35,6 +36,7 @@ def get_cf_value(cf_list, wanted_id):
         if str(cf.get("id")) == wanted_id:
             return cf.get("value", cf.get("field_value"))
     return None
+
 
 def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
     inkadmin_link_cfield_id=settings.CFILED_ID
@@ -77,6 +79,7 @@ def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
 
     # Prefetch InkAdmin contacts referenced by custom field
     inkadmin_lookup = {}
+
     if is_cercus and inkadmin_ids_needed:
         q = Q(contact_id__in=inkadmin_ids_needed)
         inkadmin_lookup = {x.contact_id: x for x in inkadmincontact.objects.filter(q)}
@@ -84,6 +87,9 @@ def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
     seen_ids = set()
     for c in ghlcontacts:
         contact_id = str(c.get("id") or "")
+        phone = c.get("phone",None)
+        email = c.get("email",None)
+
         if not contact_id or contact_id in seen_ids:
             continue
         seen_ids.add(contact_id)
@@ -101,6 +107,12 @@ def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
         if existing:
             if is_cercus:
                 existing.inkadmin_contact = linked_inkadmin_obj
+                existing.phone = phone
+                existing.email = email
+            else:
+                existing.phone = phone
+                existing.email = email
+
             contacts_to_update.append(existing)
         else:
             # Create new
@@ -109,11 +121,15 @@ def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
                     contact_id=contact_id,
                     locationId=locationId,
                     inkadmin_contact=linked_inkadmin_obj,
+                    phone=phone,
+                    email=email
                 )
             else:
                 new_obj = inkadmincontact(
                     contact_id=contact_id,
                     locationId=locationId,
+                    phone=phone,
+                    email=email
                 )
             contacts_to_create.append(new_obj)
 
@@ -132,7 +148,7 @@ def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
                 fields = []
 
                 if is_cercus:
-                    fields.append("inkadmin_contact")
+                    fields.append("inkadmin_contact","email","phone")
                 if is_cercus:
                     cercuscontact.objects.bulk_update(contacts_to_update, fields, batch_size=500)
                 else:
@@ -146,6 +162,147 @@ def add_contacts_to_db(ghlcontacts,locationId,is_cercus):
         raise
 
 
+
+def add_inkadmin_contacts_to_db(ghlcontacts, locationId):
+    """
+    - Simple version for InkAdmin.
+    - No link resolution needed.
+    - Bulk create/update InkAdmin contacts.
+    """
+    contacts_to_create = []
+    contacts_to_update = []
+
+    # Build list of contact ids from API
+    contact_ids = [str(c.get("id")) for c in ghlcontacts if c.get("id")]
+
+    # Existing InkAdmin contacts for this location
+    existing_by_id = {
+        c.contact_id: c
+        for c in inkadmincontact.objects.filter(locationId=locationId, contact_id__in=contact_ids)
+    }
+
+    seen_ids = set()
+    for c in ghlcontacts:
+        contact_id = str(c.get("id") or "")
+        if not contact_id or contact_id in seen_ids:
+            continue
+        seen_ids.add(contact_id)
+
+        phone = c.get("phone")
+        email = c.get("email")
+
+        existing = existing_by_id.get(contact_id)
+        if existing:
+            existing.phone = phone
+            existing.email = email
+            contacts_to_update.append(existing)
+        else:
+            new_obj = inkadmincontact(
+                contact_id=contact_id,
+                locationId=locationId,
+                phone=phone,
+                email=email,
+            )
+            contacts_to_create.append(new_obj)
+
+    try:
+        with transaction.atomic():
+            total_created = total_updated = 0
+
+            if contacts_to_create:
+                inkadmincontact.objects.bulk_create(contacts_to_create, batch_size=500)
+                total_created = len(contacts_to_create)
+
+            if contacts_to_update:
+                fields = ["email", "phone"]
+                inkadmincontact.objects.bulk_update(contacts_to_update, fields, batch_size=500)
+                total_updated = len(contacts_to_update)
+
+            return (total_created + total_updated), total_created, total_updated
+
+    except Exception as e:
+        print(f"Failed to save InkAdmin contacts: {e}")
+        raise
+
+
+def add_cercus_contacts_to_db(ghlcontacts, locationId):
+    """
+    - Simple version for Cercus.
+    - For each contact, fetch linked InkAdmin contact inside the loop (no prefetch).
+    - Bulk create/update Cercus contacts.
+    """
+    inkadmin_link_cfield_id = getattr(settings, "CFILED_ID", None)
+
+    contacts_to_create = []
+    contacts_to_update = []
+
+    # Build list of contact ids from API
+    contact_ids = [str(c.get("id")) for c in ghlcontacts if c.get("id")]
+
+    # Existing Cercus contacts for this location
+    existing_by_id = {
+        c.contact_id: c
+        for c in cercuscontact.objects.filter(locationId=locationId, contact_id__in=contact_ids)
+    }
+
+    seen_ids = set()
+    for c in ghlcontacts:
+        contact_id = str(c.get("id") or "")
+        if not contact_id or contact_id in seen_ids:
+            continue
+        seen_ids.add(contact_id)
+
+        phone = c.get("phone")
+        email = c.get("email")
+        if contact_id == "MWfXItjaHeWswv1mlRT4":
+            print(c.get("customFields"))
+            print(inkadmin_link_cfield_id)
+
+        # Fetch linked InkAdmin contact on each loop (simple, no lookup)
+        linked_inkadmin_obj = None
+        if inkadmin_link_cfield_id:
+            link_val = get_cf_value(c.get("customFields"), inkadmin_link_cfield_id)
+            if contact_id == "MWfXItjaHeWswv1mlRT4":
+                print(link_val)
+            if link_val:
+                linked_inkadmin_obj = inkadmincontact.objects.filter(
+                    contact_id=str(link_val)
+                ).first()
+
+        existing = existing_by_id.get(contact_id)
+        if existing:
+            existing.phone = phone
+            existing.email = email
+            existing.inkadmin_contact = linked_inkadmin_obj
+            contacts_to_update.append(existing)
+        else:
+            new_obj = cercuscontact(
+                contact_id=contact_id,
+                locationId=locationId,
+                phone=phone,
+                email=email,
+                inkadmin_contact=linked_inkadmin_obj,
+            )
+            contacts_to_create.append(new_obj)
+
+    try:
+        with transaction.atomic():
+            total_created = total_updated = 0
+
+            if contacts_to_create:
+                cercuscontact.objects.bulk_create(contacts_to_create, batch_size=500)
+                total_created = len(contacts_to_create)
+
+            if contacts_to_update:
+                fields = ["inkadmin_contact", "email", "phone"]
+                cercuscontact.objects.bulk_update(contacts_to_update, fields, batch_size=500)
+                total_updated = len(contacts_to_update)
+
+            return (total_created + total_updated), total_created, total_updated
+
+    except Exception as e:
+        print(f"Failed to save Cercus contacts: {e}")
+        raise
 
 def fetchcercuscontacts(access_token,location_id,is_cercus):
 
@@ -202,7 +359,11 @@ def fetchcercuscontacts(access_token,location_id,is_cercus):
             
             # Process this batch immediately
             try:
-                batch_pocessed, batch_created, batch_updated = add_contacts_to_db(page_contacts, location_id,is_cercus)
+                if is_cercus:
+                    batch_pocessed, batch_created, batch_updated = add_cercus_contacts_to_db(page_contacts, location_id)
+                else:
+                    batch_pocessed, batch_created, batch_updated = add_inkadmin_contacts_to_db(page_contacts, location_id)
+
                 total_processed += batch_pocessed
                 total_created += batch_created
                 total_updated += batch_updated
@@ -485,8 +646,6 @@ def mapcustomFields():
 
 
 
-
-
 # -------------------------------------------conversation part------------------------------------------------------
 
 
@@ -527,6 +686,7 @@ def add_conversations_to_db_inka(conversations_batch, location_id):
     }
 
     for conv in conversations_batch:
+
         conv_id = str(conv.get("id") or "")
 
         if not conv_id or conv_id not in seen:
@@ -536,7 +696,9 @@ def add_conversations_to_db_inka(conversations_batch, location_id):
         ink_contact_id = str(conv.get("contactId") or "")
 
         existing = existing_convs.get(conv_id)
-
+        if not ink_contact:
+            print(f"Couln't find contact conversation {conv_id} for contact_id {ink_contact_id}")
+            
         if existing:
             if existing.i_contact.contact_id != ink_contact_id:
                 existing.i_contact = ink_contact
@@ -910,8 +1072,258 @@ def build_create_message_payload(msg,conv_id):
 
 
 
-def create_message(msg, c_convId, i_conversation_id):
+
+def get_email_data(email_msg_id):
+
+    location_id = settings.INKA_LOCATION_ID
+    access_token = settings.INKA_GHL_ACCESS_TOKEN
+
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Version": settings.GHL_API_VERSION,
+    }
+
+    url = f"https://services.leadconnectorhq.com/conversations/messages/email/{email_msg_id}"
+
+    try:
+        response = requests.get(url,headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("emailMessage", {})
+
+    except requests.RequestException as e:
+        print(f"Error fetching email data for message ID {email_msg_id}: {e}")
+        return None
+
+
+def get_call_recording_urls(messageId):
+
+    location_id = settings.INKA_LOCATION_ID
+
+    url = f"https://services.leadconnectorhq.com/conversations/messages/{messageId}/locations/{location_id}/recording"
+    file_upload_url = "https://services.leadconnectorhq.com/medias/upload-file"
+
     payload = {}
+
+    headers = {
+    'Version': '2021-04-15',
+    'Authorization': f'Bearer {settings.INKA_GHL_ACCESS_TOKEN}'
+    }
+
+    response = requests.get(url, headers=headers, data=payload)
+    id_downloaded = False
+    if response.status_code == 200:
+
+        file_path = os.path.join(settings.MEDIA_ROOT, f"testing.mp3")
+
+        with open(file_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        id_downloaded = True
+    else:
+        print(f"Failed: {response.status_code}")
+        return False,None
+
+    # upload the file to ghl media and get it's url 
+    if id_downloaded:
+
+        payload = {
+
+        }
+
+        headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}',
+        'Version': settings.GHL_API_VERSION
+         }
+
+        try:
+            with open(file_path, "rb") as f:
+                files = {
+                    "file": (f"testing.mp3", f, "audio/mpeg")  
+                }
+                response = requests.post(file_upload_url, headers=headers, files=files,data={"name":"testing.mp3"})
+                data = response.json()
+                url = data.get("url", None)
+                print(data)
+                if url:
+                    return True,url
+                else:
+                    return False,None
+        except requests.RequestException as e:
+            print(response.text if response in locals() else "Error uploading file!")
+            return False,None
+
+
+
+def create_message(msg, conv, imsg_obj):
+
+    header ={
+        "Content-Type": "application/json",
+        "Accept" : "application/json",
+        "Version": settings.GHL_API_VERSION,
+        "Authorization" : f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}"
+    }
+    payload = {}
+
+    TYPE_MAP = {
+        "TYPE_SMS": "SMS",
+        "TYPE_EMAIL": "Email",
+        "TYPE_WHATSAPP": "WhatsApp",
+        "TYPE_GMB": "GMB",
+        "TYPE_INSTAGRAM": "IG",
+        "TYPE_FACEBOOK": "FB",
+        "TYPE_CALL": "Call",
+        "TYPE_LIVE_CHAT": "Live_Chat"
+    }
+
+    url = "https://services.leadconnectorhq.com/conversations/messages/inbound"
+
+
+    msg_type = TYPE_MAP.get(msg.get("messageType"), None)
+
+    if msg_type == "Email":
+
+        payload["type"]="Email"
+        payload["conversationId"]=conv.c_conversation_id
+        payload["conversationProviderId"]="68a63434417a73ba21439f4a"
+
+        email_msg_ids = msg.get("meta", {}).get("email", {}).get("messageIds", [])
+        
+        for emsgid in email_msg_ids:
+
+            is_reply=False
+
+            # getting the email details
+            email_msg_data = get_email_data(emsgid)
+
+            payload["html"]=email_msg_data.get("body", "")
+            payload["subject"]=email_msg_data.get("subject", "")
+            payload["emailFrom"]=email_msg_data.get("from", "")
+            payload["emailTo"]=email_msg_data.get("to", [])
+            payload["emailCc"]=email_msg_data.get("cc", [])
+            payload["emailBcc"]=email_msg_data.get("bcc", [])
+            payload["direction"] =email_msg_data.get("direction")
+            payload["altId"] = email_msg_data.get("altId", "")
+            payload["date"] = email_msg_data.get("dateAdded", None)
+
+            replyToMessageId = email_msg_data.get("replyToMessageId", None)
+
+            # if  it has replytomessageid finding currespoding emailmsgidfrom cercus
+            if replyToMessageId:
+                c_reaplyToMessageId = c_messages.objects.filter(i_email_msg_id=replyToMessageId).first()
+                payload["emailMessageId"] = c_reaplyToMessageId.c_email_msg_id if c_reaplyToMessageId else None
+                is_reply = True
+
+            try:
+                response = requests.post(url, headers=header, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                c_message_id= data.get("messageId", None)
+                c_email_msg_id = data.get("emailMessageId", None)
+                i_email_msg_id = emsgid
+
+                cmsgobj = c_messages.objects.create(
+                    c_message_id=c_message_id,
+                    conversation=conv,
+                    msg_type=msg_type,
+                    is_reply=is_reply,
+                    c_email_msg_id=c_email_msg_id,
+                    i_email_msg_id=i_email_msg_id,
+                    i_message=imsg_obj
+                )
+
+                print(f"Email message created in cercus with email msg id {c_email_msg_id} under message id {c_message_id}, created from inkadmin message with email msg id {i_email_msg_id}")
+            except requests.RequestException as e:
+                print(f"Error creating message for email ID {emsgid}: {e}")
+
+
+    elif msg_type == "SMS":
+        i_message_id = imsg_obj.i_message_id
+        payload["type"]="SMS"
+        payload["conversationId"]=conv.c_conversation_id
+        payload["conversationProviderId"]="68a619d8a3f9a7912b382a9a"
+        payload["message"] = msg.get("body", "")
+        payload["direction"] = msg.get("direction")
+        payload["date"] = msg.get("dateAdded", None)
+        try:
+                response = requests.post(url, headers=header, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                c_message_id = data.get("messageId", None)
+
+                smsobj = c_messages.objects.create(
+                    c_message_id=c_message_id,
+                    conversation=conv,
+                    msg_type=msg_type,
+                    i_message=imsg_obj
+                )
+
+                print(f"SMS message created in cercus with message id {c_message_id} created from inkadmin message with id {smsobj.i_sms_msg_id}")
+        except requests.RequestException as e:
+            print(f"Error creating message for SMS: {e}")
+
+    elif msg_type == "Call":
+
+        payload ={}
+        call ={}
+
+        direction = msg.get("direction", None)
+        payload["type"]="Call"
+        payload["conversationId"]=conv.c_conversation_id
+        payload["conversationProviderId"]="68a6f7bf0a839cd9d8aa89f6"
+
+        status = msg.get("meta",{}).get("call",{}).get("status", None)
+
+        call["status"] = status 
+
+        payload["direction"] = direction
+
+        is_success,call_recording_url=get_call_recording_urls(msg.get("id"))
+
+        account_phone ="+12163251865"
+        contactid= msg.get("contactId", None)
+        contactobj = inkadmincontact.objects.filter(contact_id=contactid).first()
+        contact_phone = contactobj.phone if contactobj else None
+        
+        if direction == "inbound":
+            call["to"] = account_phone
+            call["from"] = contact_phone
+
+        if direction == "outbound":
+            call["to"] = contact_phone
+            call["from"] = account_phone
+
+        payload["call"] = call
+
+        if is_success:
+            payload["attachments"] = [call_recording_url]
+        
+        try:
+            response = requests.post(url, headers=header, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            message_id = data.get("messageId", None)
+            call_recording_url = call_recording_url
+
+            callmsgobj = c_messages.objects.create(
+                c_message_id=message_id,
+                conversation=conv,
+                msg_type="Call",
+                call_recording_url=call_recording_url
+            )
+
+            print(f"Call message created in cercus with message id {message_id} and recording url {call_recording_url} created from inkadmin message with id {imsg_obj.i_message_id}")
+        
+        except requests.RequestException as e:
+            print(response.text if 'response' in locals() else "Error creating message for Call!")
+            print(f"Error creating message for Call: {e}")
+
+    else:
+        print(f"Message Type Out of scope for creation : {msg_type}")
 
 
 
@@ -964,6 +1376,49 @@ def fetch_messages_for_conversation(conversation_id,):
     return all_messages
 
 
+def save_inka_messages(i_conversation_id, inkmessages):
+    try:
+        conv = conversation.objects.get(i_conversation_id=i_conversation_id)
+    except conversation.DoesNotExist:
+        print(f"No conversation found for ID {i_conversation_id}")
+        return 0
+
+    to_create = []
+
+    for msg in inkmessages:
+        msg_id = msg.get("id")
+        msg_type = msg.get("messageType")
+
+        # Extract email message IDs safely (list)
+        email_msg_ids = (
+            msg.get("meta", {})
+               .get("email", {})
+               .get("messageIds", [])
+        )
+
+        # Skip if already exists
+        if i_messages.objects.filter(i_message_id=msg_id).exists():
+            continue
+
+        # Wrap list in dict for JSONField if available
+        email_msg_ids_object = {"messageIds": email_msg_ids} if email_msg_ids else None
+
+        to_create.append(
+            i_messages(
+                i_message_id=msg_id,
+                conversation=conv,
+                msg_type=msg_type,
+                emil_msg_ids=email_msg_ids_object
+            )
+        )
+
+    # Bulk insert
+    if to_create:
+        i_messages.objects.bulk_create(to_create, batch_size=500)
+
+    return len(to_create)
+
+
 
 def map_conversations():
     from .models import conversation
@@ -974,13 +1429,32 @@ def map_conversations():
         i_conversation_id = conv.i_conversation_id
         
 
-        try:
-            result = create_conversation_for_contact(i_contact_id, i_conversation_id)
-            conv.refresh_from_db()
-            created += 1
-        except Exception as e:
-            print(f"Error mapping conversation for contact {i_contact_id}: {e}")
+        # try:
+        #     result,conv_id = create_conversation_for_contact(i_contact_id, i_conversation_id)
+        #     conv.refresh_from_db()
+        #     created += 1
+        # except Exception as e:
+        #     print(f"Error mapping conversation for contact {i_contact_id}: {e}")
 
-        inkmessages,c_convId = fetch_messages_for_conversation(i_conversation_id)
+        inkmessages = fetch_messages_for_conversation(i_conversation_id)
+        conv_id=90
         for msg in inkmessages:
-            create_message(msg, c_convId, i_conversation_id)
+
+            email_msg_ids= msg.get("meta", {}).get("email", {}).get("messageIds", [])
+            email_msg_ids_obj = {"messageIds":email_msg_ids} if email_msg_ids else None
+
+            imsg_obj=i_messages.objects.create(
+                i_message_id=str(msg.get("id")),
+                conversation=conv,
+                msg_type=msg.get("messageType"),
+                email_msg_ids=email_msg_ids_obj,
+            )
+
+            create_message(
+                msg,
+                conv,
+                imsg_obj
+            )
+
+            print(f"Migration completed for conversation {conv}")
+        

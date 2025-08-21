@@ -1,3 +1,4 @@
+import os
 
 from pathlib import Path
 
@@ -123,3 +124,6 @@ INKA_LOCATION_ID=config("INKA_LOCATION_ID")
 
 
 CFILED_ID="bbFAnRQNcOIvDxDSKLEM"
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')

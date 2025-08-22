@@ -38,6 +38,7 @@ class conversation(models.Model):
     c_conversation_id=models.CharField(max_length=100, unique=True,blank=True, null=True)
     i_contact = models.ForeignKey(inkadmincontact, on_delete=models.CASCADE, related_name='conversations',blank=True, null=True)
     i_conversation_id=models.CharField(max_length=100, unique=True,blank=True, null=True)
+    is_migrated = models.BooleanField(default=False)
 
     def __str__(self):
         return f"Conversation inka-conv-id {self.i_conversation_id} - cercus-conv-id {self.c_conversation_id}"

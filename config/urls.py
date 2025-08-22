@@ -16,7 +16,9 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path
+from conversation.views import ConversationView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('conversations/', ConversationView.as_view(), name='conversation'),    
 ]

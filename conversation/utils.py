@@ -262,8 +262,8 @@ def add_cercus_contacts_to_db(ghlcontacts, locationId):
         linked_inkadmin_obj = None
         if inkadmin_link_cfield_id:
             link_val = get_cf_value(c.get("customFields"), inkadmin_link_cfield_id)
-            if contact_id == "MWfXItjaHeWswv1mlRT4":
-                print(link_val)
+            if link_val in ["dowHfn4CLwNwGSdvgfwy","isWHRvVuR2bWvFiLdfpP","zwdLWeitH8mzNqLmXZD1","4fhHPQtoWJ5XR2ifhNsU","XP5vxJeM0cJ6YvKBYzTH","VpowxOprkIEFMiY1gVD0","6yOJ5ysFmjbNooz94yW7","LYFM9Tt6D4wqBNgoydGm"]:
+                print(f"cercus contact_id {contact_id} has suspicious link value {link_val}; skipping link")
             if link_val:
                 linked_inkadmin_obj = inkadmincontact.objects.filter(
                     contact_id=str(link_val)
@@ -444,7 +444,7 @@ def get_cercus_inkadmin_contact_cfieldid() -> str | None:
 
 
 def create_contact(contact_data: dict, location_id: str, access_token: str) -> dict:
-    url = "https://services.leadconnectorhq.com/contacts"
+    url = "https://services.leadconnectorhq.com/contacts/"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -454,16 +454,8 @@ def create_contact(contact_data: dict, location_id: str, access_token: str) -> d
     email = contact_data.get("email")
     phone = contact_data.get("phone")
 
-    first_name = (
-        contact_data.get("firstName")
-        or contact_data.get("firstNameLowerCase")
-        or None
-    )
-    last_name = (
-        contact_data.get("lastName")
-        or contact_data.get("lastNameLowerCase")
-        or None
-    )
+    first_name = contact_data.get("firstName")
+    last_name = contact_data.get("lastName")
     full_name = (
         contact_data.get("fullName")
         or contact_data.get("fullNameLowerCase")
@@ -471,10 +463,25 @@ def create_contact(contact_data: dict, location_id: str, access_token: str) -> d
     )
 
     address = contact_data.get("address") or None
-
+    source = contact_data.get("source",None)
+    type = contact_data.get("type",None)
+    website = contact_data.get("website",None)
+    dnd = contact_data.get("dnd",None)
+    dndSettings = contact_data.get("dndSettings",None)
+    state = contact_data.get("state",None)
+    bussinessName = contact_data.get("businessName",None)
+    companyName = contact_data.get("companyName",None)
+    city = contact_data.get("city",None)
+    dateOfBirth = contact_data.get("dateOfBirth",None)
+    assignedTo = contact_data.get("assignedTo",None)
+    followers =contact_data.get("followers",[])
+    opportunities =contact_data.get("opportunities",[])
+    postalCode = contact_data.get("postalCode",None)
+    businessId = contact_data.get("businessId",None)
     additionalemails = contact_data.get("additionalEmails") or []
     additionalphones = contact_data.get("additionalPhones") or []
-
+    country = contact_data.get("country",None)
+    
     # Build mapped custom fields for Cercus (id + value)
     pcfields = []
     for field in contact_data.get("customFields") or []:
@@ -486,6 +493,7 @@ def create_contact(contact_data: dict, location_id: str, access_token: str) -> d
 
         mapping = cfieldmapping.objects.filter(inkadmin_cfield_id=ink_id).first()
         if mapping:
+            print(f"inkadmin customefield with id{ink_id} mapped to cercus customefield with id{mapping.cercus_cfield_id} for name {mapping.field_name}")
             pcfields.append({"id": mapping.cercus_cfield_id, "field_value": value})
 
     # Add a custom field that captures the InkAdmin contact id (if mapping exists)
@@ -505,21 +513,35 @@ def create_contact(contact_data: dict, location_id: str, access_token: str) -> d
         "phone": phone,
         "firstName": first_name,
         "lastName": last_name,
-        "fullName": full_name,
         "additionalEmails": [e for e in additionalemails if e],
         "additionalPhones": [p for p in additionalphones if p],
-        "address": address,
+        "address1": address,
         "customFields": pcfields,
         "tags": tags,
+        "city": city,
+        "state": state,
+        "postalCode": postalCode,
+        "country": country,
+        "website": website,
+        "dnd": dnd,
+        "source": source,
+        "companyName": companyName
     }
+    if dndSettings:
+        payload["dndSettings"] = dndSettings
 
+    print(payload)
     print(f"Creating contact {contact_data.get('id')} firstname: {first_name} lastname: {last_name} email: {email} phone: {phone}\n")
-    return True
-    # r = requests.post(url, headers=headers, json=payload, timeout=30)
-    # r.raise_for_status()
-    # data = r.json()
-
-    # return data.get("contact", data)
+    # return True
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("contact", data)
+    except RequestException as e:
+        print(f"Error creating contact: {e}")
+        print(r.text if 'r' in locals() else "No response object")
+        return {}
 
 
 
@@ -530,8 +552,8 @@ def map_contacts():
 
     inkadmin_contacts = (
         inkadmincontact.objects
-        .filter(cercus_contacts__isnull=True)   # not linked to any Cercus contact yet
-        .exclude(contact_id__in=[None, ""])
+        .filter(cercus_contacts__isnull=True)  
+        .exclude(contact_id__in=[None, "","iZlZQjIGInd9Y2y9uuxz"])
         .distinct()
         .iterator()
     )
@@ -556,28 +578,31 @@ def map_contacts():
         except Exception as e:
             print(f"Create failed for {contact.contact_id}: {e}")
             continue
-        if resp:
-            created +=1
-        # contact = resp
-        # new_id = str(contact.get("id") or "")
-        # if not new_id:
-        #     print(f"Create failed for {contact.contact_id}; bad response: {resp}")
-        #     continue
+        
+        ccontact = resp
+        new_id = str(ccontact.get("id") or "")
+        phone = ccontact.get("phone",None)
+        email = ccontact.get("email",None)
+        if not new_id:
+            print(f"Create failed for {contact.contact_id}; bad response: {resp}")
+            continue
 
 
-        # with transaction.atomic():
-        #     cc, was_created = cercuscontact.objects.update_or_create(
-        #         contact_id=new_id,
-        #         defaults={
-        #             "locationId": settings.CERCUS_LOCATION_ID,
-        #             "is_newly_created": True,
-        #             "inkadmin_contact": contact,
-        #         },
-        #     )
-        # if was_created:
-        #     created += 1
-        # else:
-        #     updated += 1
+        with transaction.atomic():
+            cc, was_created = cercuscontact.objects.update_or_create(
+                contact_id=new_id,
+                defaults={
+                    "locationId": settings.CERCUS_LOCATION_ID,
+                    "is_newly_created": True,
+                    "inkadmin_contact": contact,
+                    "phone": phone,
+                    "email": email
+                },
+            )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
 
     print(f"created={created}, total_processed={created+updated}")
 
@@ -932,6 +957,35 @@ def fetch_cercus_conversations():
 
 
 
+def fetch_conversation_id(contact_id):
+    location_id = settings.CERCUS_LOCATION_ID
+    token = settings.CERCUS_GHL_ACCESS_TOKEN
+
+    url = f"https://services.leadconnectorhq.com/conversations/search?locationId={location_id}&contactId={contact_id}"
+
+    headers = {
+        "Accept": "application/json",
+        "Version": "2021-04-15",
+        "Authorization": f"Bearer {token}"
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+
+        conversations = data.get("conversations", [])
+        if not conversations:
+            print("No conversations found.")
+            return None
+
+        # Return first conversation's id
+        return conversations[0].get("id")
+
+    except requests.RequestException as e:
+        print(f"Error fetching conversation: {e}")
+        return None
+
 
 def create_conversation_for_contact(i_contact_id,i_conversation_id):
 
@@ -953,6 +1007,7 @@ def create_conversation_for_contact(i_contact_id,i_conversation_id):
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}",
+        "Version": settings.GHL_API_VERSION
     }
 
     payload = {
@@ -980,6 +1035,27 @@ def create_conversation_for_contact(i_contact_id,i_conversation_id):
     
         
     except requests.RequestException as e:
+        if response.status_code == 400:
+            data= response.json()
+            message = data.get("message","")
+
+            if message.lower().strip() == "conversation already exists":
+                print(f"Conversation already exists for contact {i_contact_id}; skipping creation.")
+                c_conversation_id = fetch_conversation_id(c_contact.contact_id)
+
+                if not c_conversation_id:
+                    print(f"Failed to fetch existing conversation for contact {i_contact_id}")
+                    return False,None
+                
+                print(f"Fetched existing conversation {c_conversation_id} for contact {c_contact.contact_id}")
+
+                conv=conversation.objects.filter(i_contact=i_contact, i_conversation_id=i_conversation_id).first()
+                conv.c_contact=c_contact
+                conv.c_conversation_id=c_conversation_id
+                conv.save()
+
+                return True,c_conversation_id
+            
         print(f"Error creating conversation for contact {i_contact_id}: {e}")
         print(response.text if 'response' in locals() else "No response object")
         return False,None
@@ -1116,7 +1192,7 @@ def get_call_recording_urls(messageId):
     id_downloaded = False
     if response.status_code == 200:
 
-        file_path = os.path.join(settings.MEDIA_ROOT, f"testing.mp3")
+        file_path = os.path.join(settings.MEDIA_ROOT, f"{messageId}.mp3")
 
         with open(file_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
@@ -1142,14 +1218,14 @@ def get_call_recording_urls(messageId):
         try:
             with open(file_path, "rb") as f:
                 files = {
-                    "file": (f"testing.mp3", f, "audio/mpeg")  
+                    "file": (f"{messageId}.mp3", f, "audio/mpeg")  
                 }
                 response = requests.post(file_upload_url, headers=headers, files=files,data={"name":"testing.mp3"})
                 data = response.json()
-                url = data.get("url", None)
+                file_url = data.get("url", None)
                 print(data)
-                if url:
-                    return True,url
+                if file_url:
+                    return True,file_url
                 else:
                     return False,None
         except requests.RequestException as e:
@@ -1166,7 +1242,7 @@ def create_message(msg, conv, imsg_obj):
         "Version": settings.GHL_API_VERSION,
         "Authorization" : f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}"
     }
-    payload = {}
+    
 
     TYPE_MAP = {
         "TYPE_SMS": "SMS",
@@ -1185,15 +1261,18 @@ def create_message(msg, conv, imsg_obj):
     msg_type = TYPE_MAP.get(msg.get("messageType"), None)
 
     if msg_type == "Email":
-
+    
+        payload ={}
         payload["type"]="Email"
         payload["conversationId"]=conv.c_conversation_id
         payload["conversationProviderId"]="68a63434417a73ba21439f4a"
 
         email_msg_ids = msg.get("meta", {}).get("email", {}).get("messageIds", [])
-        
-        for emsgid in email_msg_ids:
 
+        
+        prev = None
+        for emsgid in email_msg_ids:
+            
             is_reply=False
 
             # getting the email details
@@ -1202,12 +1281,24 @@ def create_message(msg, conv, imsg_obj):
             payload["html"]=email_msg_data.get("body", "")
             payload["subject"]=email_msg_data.get("subject", "")
             payload["emailFrom"]=email_msg_data.get("from", "")
-            payload["emailTo"]=email_msg_data.get("to", [])
+
+            tomail = email_msg_data.get("to", [])
+
+            if isinstance(tomail, list):
+                to = tomail.pop(0)
+            else:
+                to = tomail
+
+            payload["emailTo"]=to
             payload["emailCc"]=email_msg_data.get("cc", [])
             payload["emailBcc"]=email_msg_data.get("bcc", [])
             payload["direction"] =email_msg_data.get("direction")
             payload["altId"] = email_msg_data.get("altId", "")
             payload["date"] = email_msg_data.get("dateAdded", None)
+
+            attachments =email_msg_data.get("attachments", [])
+            if attachments:
+                payload["attachments"] =attachments
 
             replyToMessageId = email_msg_data.get("replyToMessageId", None)
 
@@ -1217,7 +1308,12 @@ def create_message(msg, conv, imsg_obj):
                 payload["emailMessageId"] = c_reaplyToMessageId.c_email_msg_id if c_reaplyToMessageId else None
                 is_reply = True
 
+            else:
+                if prev:
+                    payload["emailMessageId"] = prev
+                    is_reply = True
             try:
+                print(f"Creating message  email for inkaemail id {imsg_obj.i_message_id} with payload: {payload}")
                 response = requests.post(url, headers=header, json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -1235,12 +1331,16 @@ def create_message(msg, conv, imsg_obj):
                     i_message=imsg_obj
                 )
 
+                prev = c_email_msg_id
+
                 print(f"Email message created in cercus with email msg id {c_email_msg_id} under message id {c_message_id}, created from inkadmin message with email msg id {i_email_msg_id}")
             except requests.RequestException as e:
+                print(response.text if 'response' in locals() else "Error creating message for email!")
                 print(f"Error creating message for email ID {emsgid}: {e}")
 
 
     elif msg_type == "SMS":
+        payload={}
         i_message_id = imsg_obj.i_message_id
         payload["type"]="SMS"
         payload["conversationId"]=conv.c_conversation_id
@@ -1248,7 +1348,15 @@ def create_message(msg, conv, imsg_obj):
         payload["message"] = msg.get("body", "")
         payload["direction"] = msg.get("direction")
         payload["date"] = msg.get("dateAdded", None)
+
+        attachments = msg.get("attachments", [])
+        if attachments:
+            payload["attachments"] = attachments
+
+        payload["altId"] = msg.get("altId", "")
+
         try:
+                print(f"Creating message for SMS ID {i_message_id} with payload: {payload}")
                 response = requests.post(url, headers=header, json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -1261,11 +1369,13 @@ def create_message(msg, conv, imsg_obj):
                     i_message=imsg_obj
                 )
 
-                print(f"SMS message created in cercus with message id {c_message_id} created from inkadmin message with id {smsobj.i_sms_msg_id}")
+                print(f"SMS message created in cercus with message id {c_message_id} created from inkadmin message with id {smsobj.i_message_id}")
         except requests.RequestException as e:
+            print(response.text if 'response' in locals() else "Error creating message for SMS!")
             print(f"Error creating message for SMS: {e}")
 
-    elif msg_type == "Call":
+
+    if msg_type == "Call":
 
         payload ={}
         call ={}
@@ -1274,6 +1384,7 @@ def create_message(msg, conv, imsg_obj):
         payload["type"]="Call"
         payload["conversationId"]=conv.c_conversation_id
         payload["conversationProviderId"]="68a6f7bf0a839cd9d8aa89f6"
+        payload["date"] = msg.get("dateAdded", None)
 
         status = msg.get("meta",{}).get("call",{}).get("status", None)
 
@@ -1298,10 +1409,11 @@ def create_message(msg, conv, imsg_obj):
 
         payload["call"] = call
 
-        if is_success:
+        if is_success and call_recording_url:
             payload["attachments"] = [call_recording_url]
         
         try:
+            print(f"Creating message for Call ID {imsg_obj.i_message_id} with payload: {payload}")
             response = requests.post(url, headers=header, json=payload)
             response.raise_for_status()
             data = response.json()
@@ -1313,7 +1425,8 @@ def create_message(msg, conv, imsg_obj):
                 c_message_id=message_id,
                 conversation=conv,
                 msg_type="Call",
-                call_recording_url=call_recording_url
+                call_recording_url=call_recording_url,
+                i_message=imsg_obj
             )
 
             print(f"Call message created in cercus with message id {message_id} and recording url {call_recording_url} created from inkadmin message with id {imsg_obj.i_message_id}")
@@ -1321,6 +1434,7 @@ def create_message(msg, conv, imsg_obj):
         except requests.RequestException as e:
             print(response.text if 'response' in locals() else "Error creating message for Call!")
             print(f"Error creating message for Call: {e}")
+
 
     else:
         print(f"Message Type Out of scope for creation : {msg_type}")
@@ -1422,39 +1536,66 @@ def save_inka_messages(i_conversation_id, inkmessages):
 
 def map_conversations():
     from .models import conversation
-    conversations = conversation.objects.filter().iterator()
+    convids= ['UDdSyWalQAI5E1dz8Gx5', 'N7LjGQ8Fm02MUn7zRr6R', 'NCweR7uD9F8HiIlArUBh']
+
+    conversations = conversation.objects.filter(c_messages__isnull=True).iterator()
+    
     created = 0
     for conv in conversations:
+        print(f"processing conversation {conv.i_conversation_id}")
         i_contact_id = conv.i_contact.contact_id
         i_conversation_id = conv.i_conversation_id
         
+        try:
+            
+            result,conv_id = create_conversation_for_contact(i_contact_id, i_conversation_id)
+            conv.refresh_from_db()
+            created += 1
 
-        # try:
-        #     result,conv_id = create_conversation_for_contact(i_contact_id, i_conversation_id)
-        #     conv.refresh_from_db()
-        #     created += 1
-        # except Exception as e:
-        #     print(f"Error mapping conversation for contact {i_contact_id}: {e}")
+            if not result:
+                continue
+            
+        except Exception as e:
+            print(f"Error mapping conversation for contact {i_contact_id}: {e}")
+            
 
         inkmessages = fetch_messages_for_conversation(i_conversation_id)
-        conv_id=90
+        
         for msg in inkmessages:
 
             email_msg_ids= msg.get("meta", {}).get("email", {}).get("messageIds", [])
             email_msg_ids_obj = {"messageIds":email_msg_ids} if email_msg_ids else None
 
-            imsg_obj=i_messages.objects.create(
-                i_message_id=str(msg.get("id")),
-                conversation=conv,
-                msg_type=msg.get("messageType"),
-                email_msg_ids=email_msg_ids_obj,
-            )
 
-            create_message(
-                msg,
-                conv,
-                imsg_obj
-            )
+            imsg_obj, created = i_messages.objects.update_or_create(
+                                    i_message_id=str(msg.get("id")), 
+                                    defaults={
+                                        "conversation": conv,
+                                        "msg_type": msg.get("messageType"),
+                                        "emil_msg_ids": email_msg_ids_obj,
+                                    }
+                                )
+            
+            try:
+                create_message(
+                    msg,
+                    conv,
+                    imsg_obj
+                )
+            except Exception as e:
+                print(f"Error creating message for conversation {conv.i_conversation_id}: {e}")
 
-            print(f"Migration completed for conversation {conv}")
+
+        print(f"Migration completed for conversation {conv}")
+        conv.is_migrated = True
+        conv.save()
+
         
+
+def clean_contacts():
+    conv = conversation.objects.all().delete()
+    print(conv)
+    c = cercuscontact.objects.all().delete()
+    print(c)
+    i = inkadmincontact.objects.all().delete()
+    print(i)

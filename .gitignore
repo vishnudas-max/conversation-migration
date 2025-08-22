@@ -3,11 +3,11 @@
 *.pot
 *.pyc
 __pycache__
-db.sqlite3
+
 media
 
 **/migrations/
-**/__pycache__/
+
 
 
 # Backup files # 

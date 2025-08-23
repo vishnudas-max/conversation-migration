@@ -1,8 +1,8 @@
-from .utils import map_conversations
+from .utils import map_remaining
 from celery import shared_task
 
 @shared_task()
 def start_conversation_migration():
-    print("Starting conversation migration...")
-    map_conversations()
-    print("conversation migration finished..")
+    print("Starting remaining migration...")
+    map_remaining()
+    print("Remaining migration finished..")

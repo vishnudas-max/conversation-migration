@@ -1199,7 +1199,7 @@ def get_call_recording_urls(messageId):
                 f.write(chunk)
         id_downloaded = True
     else:
-        print(f"Failed: {response.status_code}")
+        print(f"Failed: call recording might not be available {response.status_code}")
         return False,None
 
     # upload the file to ghl media and get it's url 
@@ -1231,6 +1231,34 @@ def get_call_recording_urls(messageId):
         except requests.RequestException as e:
             print(response.text if response in locals() else "Error uploading file!")
             return False,None
+
+
+def add_outbound_call(payload: dict):
+    
+   
+
+    url = "https://services.leadconnectorhq.com/conversations/messages/outbound"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}",
+        "Version": settings.GHL_API_VERSION
+    }
+
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=30)
+        response_data = response.json()
+        if response.status_code == 200:
+            return True, response_data
+        else:
+            raise Exception(
+                f"Failed to send outbound call. "
+                f"Status: {response.status_code}, Response: {response_data}"
+            )
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Error while sending outbound call: {e}")
+
 
 
 
@@ -1353,7 +1381,9 @@ def create_message(msg, conv, imsg_obj):
         if attachments:
             payload["attachments"] = attachments
 
-        payload["altId"] = msg.get("altId", "")
+        altid = msg.get("altId", "")
+        if altid:
+            payload["altId"] = altid
 
         try:
                 print(f"Creating message for SMS ID {i_message_id} with payload: {payload}")
@@ -1381,10 +1411,15 @@ def create_message(msg, conv, imsg_obj):
         call ={}
 
         direction = msg.get("direction", None)
+
         payload["type"]="Call"
         payload["conversationId"]=conv.c_conversation_id
         payload["conversationProviderId"]="68a6f7bf0a839cd9d8aa89f6"
         payload["date"] = msg.get("dateAdded", None)
+
+        altid = msg.get("altId", None)
+        if altid:
+            payload["altId"] = altid
 
         status = msg.get("meta",{}).get("call",{}).get("status", None)
 
@@ -1392,8 +1427,12 @@ def create_message(msg, conv, imsg_obj):
 
         payload["direction"] = direction
 
-        is_success,call_recording_url=get_call_recording_urls(msg.get("id"))
-
+        try:
+            is_success,call_recording_url=get_call_recording_urls(msg.get("id"))
+        except Exception as e:
+            print(f"Error fetching call recording URL: {e}")
+            raise e
+        
         account_phone ="+12163251865"
         contactid= msg.get("contactId", None)
         contactobj = inkadmincontact.objects.filter(contact_id=contactid).first()
@@ -1414,9 +1453,21 @@ def create_message(msg, conv, imsg_obj):
         
         try:
             print(f"Creating message for Call ID {imsg_obj.i_message_id} with payload: {payload}")
-            response = requests.post(url, headers=header, json=payload)
-            response.raise_for_status()
-            data = response.json()
+            data=None
+            if direction == 'inbound':
+                response = requests.post(url, headers=header, json=payload)
+                response.raise_for_status()
+                data = response.json()
+
+            elif direction == 'outbound':
+                try:
+                    is_success,data = add_outbound_call(payload)
+                except Exception as e:
+                   print(f"Error adding outbound call: {e}")
+                   raise e
+            if data is None:
+                print(f"Failed to create outbound call data {data}")
+                raise
 
             message_id = data.get("messageId", None)
             call_recording_url = call_recording_url
@@ -1599,3 +1650,80 @@ def clean_contacts():
     print(c)
     i = inkadmincontact.objects.all().delete()
     print(i)
+
+
+
+
+def get_message(message_id: str):
+
+    url = f"https://services.leadconnectorhq.com/conversations/messages/{message_id}"
+
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.INKA_GHL_ACCESS_TOKEN}",
+        "Version":settings.GHL_API_VERSION
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()  
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching message {message_id}: {e}")
+        return None
+
+
+
+def map_remaining():
+    msg_types = ["TYPE_CALL","TYPE_EMAIL","TYPE_SMS"]
+
+    allmessages = i_messages.objects.filter(msg_type__in=msg_types,c_messages__isnull=True)
+
+    for i_msg in allmessages:
+        conv = i_msg.conversation
+        i_contact_id = conv.i_contact.contact_id
+        i_conversation_id = conv.i_conversation_id
+
+        if conv.c_conversation_id is None or conv.c_contact is None:
+            try:
+                result,conv_id = create_conversation_for_contact(i_contact_id, i_conversation_id)
+                conv.refresh_from_db()
+                created += 1
+
+                if not result:
+                    continue
+            except Exception as e:
+                print(f"Error mapping conversation for contact {i_contact_id}: {e}")
+        
+        msg_data = get_message(i_msg.i_message_id)
+
+        if not msg_data:
+            print(f"Could not retrieve data for message {i_msg.i_message_id}")
+            continue
+
+        email_msg_ids= msg_data.get("meta", {}).get("email", {}).get("messageIds", [])
+        email_msg_ids_obj = {"messageIds":email_msg_ids} if email_msg_ids else None
+
+
+        imsg_obj, created = i_messages.objects.update_or_create(
+                                    i_message_id=str(msg_data.get("id")), 
+                                    defaults={
+                                        "conversation": conv,
+                                        "msg_type": msg_data.get("messageType"),
+                                        "emil_msg_ids": email_msg_ids_obj,
+                                    }
+                                )
+            
+        try:
+            create_message(
+                msg_data,
+                conv,
+                imsg_obj
+            )
+        except Exception as e:
+            print(f"Error creating message for conversation {conv.i_conversation_id}: {e}")
+
+
+        print(f"Migration completed for conversation {conv}")
+        conv.is_migrated = True
+        conv.save()

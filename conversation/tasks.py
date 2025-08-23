@@ -4,4 +4,5 @@ from celery import shared_task
 @shared_task()
 def start_conversation_migration():
     print("Starting conversation migration...")
-    # map_conversations()
+    map_conversations()
+    print("conversation migration finished..")

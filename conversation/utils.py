@@ -1198,6 +1198,7 @@ def get_call_recording_urls(messageId):
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         id_downloaded = True
+        print(f"Success: call recording downloaded for messageId {messageId} {file_path}")
     else:
         print(f"Failed: call recording might not be available {response.status_code}")
         return False,None
@@ -1215,25 +1216,27 @@ def get_call_recording_urls(messageId):
         'Version': settings.GHL_API_VERSION
          }
 
-        try:
-            with open(file_path, "rb") as f:
+        
+        with open(file_path, "rb") as f:
                 files = {
                     "file": (f"{messageId}.mp3", f, "audio/mpeg")  
                 }
-                response = requests.post(file_upload_url, headers=headers, files=files,data={"name":"testing.mp3"})
+                name = f"{messageId}.mp3"
+                response = requests.post(file_upload_url, headers=headers, files=files,data={"name":name})
                 data = response.json()
+                print(response.text)
                 file_url = data.get("url", None)
                 print(data)
-                if file_url:
-                    return True,file_url
+
+                if response.status_code in [200,201] and file_url:
+                    if file_url:
+                        return True,file_url
+                    
                 else:
-                    return False,None
-        except requests.RequestException as e:
-            print(response.text if response in locals() else "Error uploading file!")
-            return False,None
+                    print(f"Failed to upload file to GHL media {response.status_code}")
+                    raise Exception("File upload failed")
 
-
-def add_outbound_call(payload: dict):
+def add_outbound_call(payload):
     
    
 
@@ -1247,16 +1250,12 @@ def add_outbound_call(payload: dict):
     }
 
     try:
-        response = requests.post(url, headers=headers, data=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
         response_data = response.json()
-        if response.status_code == 200:
-            return True, response_data
-        else:
-            raise Exception(
-                f"Failed to send outbound call. "
-                f"Status: {response.status_code}, Response: {response_data}"
-            )
+        return True, response_data
     except requests.exceptions.RequestException as e:
+        print(response.text if 'response' in locals() else "No response object")
         raise Exception(f"Error while sending outbound call: {e}")
 
 
@@ -1422,8 +1421,10 @@ def create_message(msg, conv, imsg_obj):
             payload["altId"] = altid
 
         status = msg.get("meta",{}).get("call",{}).get("status", None)
-
-        call["status"] = status 
+        if status == 'ringing':
+            call["status"] = "pending"
+        else:
+            call["status"] = status 
 
         payload["direction"] = direction
 
@@ -1587,9 +1588,10 @@ def save_inka_messages(i_conversation_id, inkmessages):
 
 def map_conversations():
     from .models import conversation
-    convids= ['UDdSyWalQAI5E1dz8Gx5', 'N7LjGQ8Fm02MUn7zRr6R', 'NCweR7uD9F8HiIlArUBh']
 
-    conversations = conversation.objects.filter(c_messages__isnull=True).iterator()
+    inka_conv_ids = []
+
+    conversations = conversation.objects.filter(c_messages__isnull=True,i_conversation_id__in=inka_conv_ids).iterator()
     
     created = 0
     for conv in conversations:
@@ -1657,7 +1659,7 @@ def clean_contacts():
 def get_message(message_id: str):
 
     url = f"https://services.leadconnectorhq.com/conversations/messages/{message_id}"
-
+    print(f"Fetching message for message id {message_id}")
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {settings.INKA_GHL_ACCESS_TOKEN}",
@@ -1667,7 +1669,9 @@ def get_message(message_id: str):
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()  
-        return response.json()
+        print(response.json())
+        message = response.json().get("message", {})
+        return message
     except requests.exceptions.RequestException as e:
         print(f"Error fetching message {message_id}: {e}")
         return None
@@ -1679,10 +1683,14 @@ def map_remaining():
 
     allmessages = i_messages.objects.filter(msg_type__in=msg_types,c_messages__isnull=True)
 
+    count = 0
+    processed = 0
     for i_msg in allmessages:
         conv = i_msg.conversation
         i_contact_id = conv.i_contact.contact_id
         i_conversation_id = conv.i_conversation_id
+
+        print(f"processing message {i_msg.i_message_id} for conversation {conv.i_conversation_id}")
 
         if conv.c_conversation_id is None or conv.c_contact is None:
             try:
@@ -1704,7 +1712,9 @@ def map_remaining():
         email_msg_ids= msg_data.get("meta", {}).get("email", {}).get("messageIds", [])
         email_msg_ids_obj = {"messageIds":email_msg_ids} if email_msg_ids else None
 
+        msgtype = msg_data.get("messageType", None)
 
+        
         imsg_obj, created = i_messages.objects.update_or_create(
                                     i_message_id=str(msg_data.get("id")), 
                                     defaults={
@@ -1713,6 +1723,7 @@ def map_remaining():
                                         "emil_msg_ids": email_msg_ids_obj,
                                     }
                                 )
+
             
         try:
             create_message(
@@ -1720,10 +1731,91 @@ def map_remaining():
                 conv,
                 imsg_obj
             )
+            count += 1
         except Exception as e:
             print(f"Error creating message for conversation {conv.i_conversation_id}: {e}")
+            processed +=1
 
 
-        print(f"Migration completed for conversation {conv}")
+        print(f"message {i_msg.i_message_id} migrated succesfully")
         conv.is_migrated = True
         conv.save()
+        print(f"processed {count}")
+
+    print(f"Total messages migrated: {count}")
+    print(f"Total messages processed: {processed}")
+
+
+
+
+
+from django.db.models import Count
+
+def deduplicate_i_messages():
+    msg_types = ["TYPE_CALL","TYPE_EMAIL","TYPE_SMS"]
+
+    # Find i_message_id groups with duplicates
+    duplicate_groups = (
+        i_messages.objects.filter(msg_type__in=msg_types)
+        .values("i_message_id")
+        .annotate(count=Count("id"))
+        .filter(count__gt=1)
+    )
+
+    for group in duplicate_groups:
+        i_msg_id = group["i_message_id"]
+        duplicates = list(i_messages.objects.filter(i_message_id=i_msg_id))
+
+        # Separate connected and unconnected
+        connected = [msg for msg in duplicates if msg.c_messages.exists()]
+        unconnected = [msg for msg in duplicates if not msg.c_messages.exists()]
+
+        if connected:
+            # Keep the first connected, delete all others
+            to_keep = connected[0]
+            to_delete = [msg for msg in duplicates if msg != to_keep]
+        else:
+            # No connected → keep one unconnected, delete rest
+            to_keep = unconnected[0]
+            to_delete = [msg for msg in duplicates if msg != to_keep]
+
+        # Delete unwanted ones
+        for msg in to_delete:
+            print(f"Deleting duplicate i_message {msg.id} (i_message_id={i_msg_id})")
+            msg.delete()
+
+    print("✅ Deduplication completed")
+
+
+
+
+
+
+
+def clear_conversations():
+    cids=['ovI54K30dENxubwiLRm0', '3KejntT3eOwe2YD69vxn', 'cJ8DLyfpu5VF1hTkvHmB', 'EXcyOCWh4Ny4MPY4c3sA', 'k3hYcC8reXbkNsCfFtCm', 'olFDmDGFGSRH3Oe4KVt0', 'CE8xBkehubgiocHKB6aq', 'ZVSpY7xY7ZO7dgfPEDM3', 'YfiDrt96QwqzRbPlxfvf', 'rD0YNJttKJohXT96P6I9', '3KOtsYvv6QjV8alLSfri', '2RyK3d7sCyHuS86q5eqI', 'GylmpU1jRcAckcW9Mhzw', 's6Xa3Jv6KITqUuDNch8W', 'zRvojz2GJFnqtCXw18p9', 'vjiwtVMkmtie1QJrOSQx', '7hZYn15VYzAWNqrQfEA7', 'hkeLNaXn0NNvPb1K24s0', 'Jp8H3lKQ7sllQ9oEyQV2', 'GMYQmHKCO9FMGbapexr9', 'nctZixi6qKQo9pV47Bdm', 'rWKBkXDJdrfOWlYJaME2', 'nWQyuwCQ4afRVBQG8pMp', 'xRDvu3AMS98Owj4pQ0sF', 'be1f6AZfZrJLyMEzI0cd', 'H2p9e8j162blO6c7Z4CX', 'uKo9X0jYWzwVUBtIaqLH', 'QIdtmLZD0e39yVcI5rjx', 'djKr2ICwjjt1FDDqcSzn', 'YZgVL6qqIrsczp7Chztv', 'pUnbjJwOCAw3e6koWYQF', 'jPUoew9KSNEo9nWy43Mq', 'hrDfX7FQA2GjiALQTiXC', 'vrTilUGRjXipm4XWds9t', '4fK7G4VGVMrAm8ulGwMx', 'bZvuGbfIte9vi7yYMpsr', 'yxiNEYKqm4mvp9migA2Y', 'yDbGJ8uZ6rYDCE6y2puI', 'PA2tBQbBcdtwuhwreBqg', 'I0UqIoHWpSHqD2sZtqHK', 'ADkhZ2ipCeigggdLQBrB', 'CrM6iXMb9tddqx57RC4G', 'EvSvboQqtcN84Xcrduf6', 'nRUwHWfPmtyyatquw97U', 'jjvkQSVbd5VM2rfWvV5D', 'VYlGWObidvph1ZDEEbg6', 'dO21oquprp4OdvCW9DKw', 'WZkjDGGkcRKEPPirUbET', 'JzFn4Yvc2XvnkX8VkMhH', '6hWeqNLaxMdI2JqzVUCI', 'vs6yy2DpxOc8S2TewRfR', 'rWEtFRazOD0wAirNMaOt', 'qG7gnxWYKC7r7TSRjQra', 'nDKXAKJ3sRYWHxGiSE8k', 'ESd8cZ9q2Ej6G8S9tR72', 'nIBnoT4HzUdGh6ycFd3w', 'OP2BjZBOpdJfCILIwcHN', '5pPhe2dOUyRnuKgQmMB8', 'p7BpdqOgQjaikjUhAhhQ', 'd5PeZpbciT9pcDvHVOVj', '125W0pIU7sFkYLAHnFjp']
+    
+    conversations = conversation.objects.filter(c_messages__c_message_id__in=cids).distinct()
+
+    header ={
+        "Accept" : "application/json",
+        "Version": settings.GHL_API_VERSION,
+        "Authorization" : f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}"
+    }
+
+    for conv in conversations:
+        print(f"Cleaning conversation {conv}")
+
+        url = f"https://services.leadconnectorhq.com/conversations/{conv.c_conversation_id}"
+
+        try:
+            response = requests.delete(url, headers=header)
+            response.raise_for_status()
+            conv.c_messages.all().delete()
+            conv.c_conversation_id = None
+            conv.c_contact = None
+            conv.save()
+            print(f"Cleaned conversation {conv}")
+
+        except requests.RequestException as e:
+            print(f"Error cleaning conversation {conv}:{e} \n {response.text if 'response' in locals() else e}")

@@ -63,3 +63,5 @@ class c_messages(models.Model):
     c_email_msg_id = models.CharField(max_length=100, blank=True, null=True)
     i_email_msg_id= models.CharField(max_length=100, blank=True, null=True)
     call_recording_url = models.URLField(blank=True, null=True)
+
+

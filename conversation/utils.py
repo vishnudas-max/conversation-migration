@@ -1829,10 +1829,11 @@ def parse_date(date_str: str):
     if date_str.endswith("Z"):
         date_str = date_str.replace("Z", "+00:00")
     dt = datetime.fromisoformat(date_str)
-    return dt.date().strftime("%d-%m-%Y")
+    # include time (24hr format)
+    return dt.strftime("%m-%d-%Y %H:%M:%S")
 
 
-def create_note_from_body(body, msgtype, i_contact_id, messages):
+def create_note_from_body(body, msgtype, i_contact_id, messages,note_id):
     """Helper to send one note for multiple messages of same conversation/type"""
     i_contact_obj = inkadmincontact.objects.filter(contact_id=i_contact_id).first()
     c_contact = getattr(i_contact_obj, "cercus_contacts", None)
@@ -1842,7 +1843,7 @@ def create_note_from_body(body, msgtype, i_contact_id, messages):
         raise Exception(f"{i_contact_id} has no mapped cercus contact")
 
     payload = {"body": body}
-    url = f"https://services.leadconnectorhq.com/contacts/{c_contact_id}/notes"
+    url = f"https://services.leadconnectorhq.com/contacts/{c_contact_id}/notes/{note_id}"
 
     header = {
         "Content-Type": "application/json",
@@ -1851,20 +1852,22 @@ def create_note_from_body(body, msgtype, i_contact_id, messages):
         "Authorization": f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}"
     }
 
-    response = requests.post(url, json=payload, headers=header)
+    response = requests.put(url, json=payload, headers=header)
     response.raise_for_status()
     data = response.json().get("note", {})
     nid = str(data.get("id"))
 
     # Link this note to all included messages
     for i_msg in messages:
-        Notes.objects.create(
+        Notes.objects.update_or_create(
             note_id=nid,
             i_message=i_msg,
-            contact=c_contact,
-            note_type=msgtype
+            defaults={
+                "contact": c_contact,
+                "note_type": msgtype
+            }
         )
-
+    print(f"Updated note {note_id}")
 
 
 def create_notes_for_messages():
@@ -1872,8 +1875,8 @@ def create_notes_for_messages():
 
     # Step 1: Get distinct conversations that have pending messages of those types
     conversations = (
-        conversation.objects.filter(i_messages__msg_type__in=msg_types, i_messages__notes__isnull=True)
-        .distinct()
+        conversation.objects.filter(i_messages__msg_type__in=msg_types,)
+        .distinct()[:1]
     )
 
     notes_created = 0
@@ -1888,12 +1891,20 @@ def create_notes_for_messages():
             continue
 
         for msg_type in msg_types:  # process Instagram first, then Facebook
-            messages = conv.i_messages.filter(msg_type=msg_type, notes__isnull=True)
+            messages = conv.i_messages.filter(msg_type=msg_type)
+
+            note_id = None
+            first_msg_with_note = next((m for m in messages if m.notes.exists()), None)
+            if first_msg_with_note:
+                note_id = first_msg_with_note.notes.first().note_id
 
             if not messages.exists():
                 print(f"not messsages for {conv.i_conversation_id} with type {msg_type}")
                 continue
-
+            
+            if not note_id:
+                print(f"Failed to get note_id to update messages from conversation {conv.i_conversation_id} for msg type{msg_type}")
+                continue
             note_parts = []
 
             if msg_type == "TYPE_INSTAGRAM":
@@ -1941,7 +1952,7 @@ def create_notes_for_messages():
             if note_parts:
                 combined_body = "\n\n---\n\n".join(note_parts)
                 try:
-                    create_note_from_body(combined_body, msg_type, i_contact_id, messages)
+                    create_note_from_body(combined_body, msg_type, i_contact_id, messages,note_id)
                     notes_created += 1
                 except Exception as e:
                     print(f"Error creating combined note for conv {conv.id}, type {msg_type}: {e}")

@@ -65,3 +65,16 @@ class c_messages(models.Model):
     call_recording_url = models.URLField(blank=True, null=True)
 
 
+
+
+
+
+class Notes(models.Model):
+    note_id = models.CharField(max_length=100)
+    i_message = models.ForeignKey(i_messages, on_delete=models.CASCADE, related_name='notes',blank=True, null=True)
+    contact = models.ForeignKey(cercuscontact, on_delete=models.CASCADE, related_name='notes',blank=True, null=True)
+    note_type = models.CharField(max_length=40,null=True)
+    
+
+    def __str__(self):
+        return f"Note note-id {self.note_id} - of type {self.note_type} for contact {self.contact}  "

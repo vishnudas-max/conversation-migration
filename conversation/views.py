@@ -11,8 +11,8 @@ class ConversationView(APIView):
         start = int(request.query_params.get('start', 0))
         print(start)
         if start == 1:
-            print("Starting conversation migration...")
+            print("Starting note creation...")
             start_conversation_migration.delay()
         else:
-            print("pass query parameter start=1 to start migration")
-        return Response({"message": "pass query parameter start=1 to start migration"})
+            print("pass query parameter start=1 to start note creation")
+        return Response({"message": "pass query parameter start=1 to start note creation"})

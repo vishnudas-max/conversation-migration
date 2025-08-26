@@ -1,7 +1,14 @@
 from django.contrib import admin
 
 # Register your models here.
-from .models import cercuscontact, inkadmincontact, cfieldmapping, conversation, i_messages, c_messages
+from .models import cercuscontact, inkadmincontact, cfieldmapping, conversation, i_messages, c_messages, Notes
+
+@admin.register(Notes)
+class NotesAdmin(admin.ModelAdmin):
+    list_display = ('note_id', 'i_message', 'contact', 'note_type')
+    list_filter = ('note_type',)
+    search_fields = ('note_id', 'i_message__i_message_id', 'contact__contact_id')
+
 @admin.register(inkadmincontact)
 class InkAdminContactAdmin(admin.ModelAdmin):
     list_display = ('contact_id', 'locationId', 'phone', 'email')

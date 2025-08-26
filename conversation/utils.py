@@ -1,13 +1,15 @@
 import requests
 from django.conf import settings
 from requests.exceptions import RequestException
-from .models import cercuscontact, conversation,inkadmincontact,cfieldmapping,i_messages,c_messages
+from .models import cercuscontact, conversation,inkadmincontact,cfieldmapping,i_messages,c_messages,Notes
 import phonenumbers
 import pycountry
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 import os
+from datetime import datetime
+
 
 
 
@@ -1819,3 +1821,131 @@ def clear_conversations():
 
         except requests.RequestException as e:
             print(f"Error cleaning conversation {conv}:{e} \n {response.text if 'response' in locals() else e}")
+
+
+
+
+def parse_date(date_str: str):
+    if date_str.endswith("Z"):
+        date_str = date_str.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(date_str)
+    return dt.date().strftime("%d-%m-%Y")
+
+
+def create_note_from_body(body, msgtype, i_contact_id, messages):
+    """Helper to send one note for multiple messages of same conversation/type"""
+    i_contact_obj = inkadmincontact.objects.filter(contact_id=i_contact_id).first()
+    c_contact = getattr(i_contact_obj, "cercus_contacts", None)
+    c_contact_id = c_contact.contact_id if c_contact else None
+
+    if not c_contact_id:
+        raise Exception(f"{i_contact_id} has no mapped cercus contact")
+
+    payload = {"body": body}
+    url = f"https://services.leadconnectorhq.com/contacts/{c_contact_id}/notes"
+
+    header = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Version": settings.GHL_API_VERSION,
+        "Authorization": f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}"
+    }
+
+    response = requests.post(url, json=payload, headers=header)
+    response.raise_for_status()
+    data = response.json().get("note", {})
+    nid = str(data.get("id"))
+
+    # Link this note to all included messages
+    for i_msg in messages:
+        Notes.objects.create(
+            note_id=nid,
+            i_message=i_msg,
+            contact=c_contact,
+            note_type=msgtype
+        )
+
+
+
+def create_notes_for_messages():
+    msg_types = ["TYPE_INSTAGRAM", "TYPE_FACEBOOK"]
+
+    # Step 1: Get distinct conversations that have pending messages of those types
+    conversations = (
+        conversation.objects.filter(i_messages__msg_type__in=msg_types, i_messages__notes__isnull=True)
+        .distinct()[:1]
+    )
+
+    notes_created = 0
+    processed = 0
+
+    for conv in conversations:
+
+        i_contact_id = conv.i_contact.contact_id if conv.i_contact else None
+
+        if not i_contact_id:
+            print(f"Conversation {conv.id} has no i_contact mapped")
+            continue
+
+        for msg_type in msg_types:  # process Instagram first, then Facebook
+            messages = conv.i_messages.filter(msg_type=msg_type, notes__isnull=True)
+
+            if not messages.exists():
+                print(f"not messsages for {conv.i_conversation_id} with type {msg_type}")
+                continue
+
+            note_parts = []
+
+            if msg_type == "TYPE_INSTAGRAM":
+                note_parts.append(f"Instagram\n")
+            if msg_type == "TYPE_FACEBOOK":
+                note_parts.append(f"Facebook\n")
+            
+            for i_msg in messages:
+                print(f"Processing message {i_msg.i_message_id} of type {msg_type}")
+
+                msg_data = get_message(i_msg.i_message_id)
+
+                if not msg_data:
+                    print(f"Could not retrieve data for message {i_msg.i_message_id}")
+                    continue
+
+                # Build message string (reuse same logic as create_note, but not POST yet)
+                mtype = msg_data.get("messageType", None)
+                direction = msg_data.get("direction")
+                attachments = msg_data.get("attachments", [])
+                status = msg_data.get("status")
+                message = msg_data.get("body")
+                date_str = msg_data.get("dateAdded")
+                date = parse_date(date_str) if date_str else ""
+
+                pageId, pageName = None, None
+                if mtype == "TYPE_INSTAGRAM":
+                    pageId = msg_data.get("meta", {}).get("ig", {}).get("pageId")
+                    pageName = msg_data.get("meta", {}).get("ig", {}).get("pageName")
+                elif mtype == "TYPE_FACEBOOK":
+                    pageId = msg_data.get("meta", {}).get("fb", {}).get("pageId")
+                    pageName = msg_data.get("meta", {}).get("fb", {}).get("pageName")
+
+                note_parts.append(
+                    f"Date: {date}\n"
+                    f"Flow: {direction}\n"
+                    f"Message: {message or '[No Message]'}\n"
+                    f"Status: {status}\n"
+                    f"Page ID: {pageId}\n"
+                    f"Page Name: {pageName}\n"
+                    f"Attachments: {', '.join(attachments) if attachments else 'None'}"
+                )
+
+            # Step 2: If we gathered any notes, join and create one single note
+            if note_parts:
+                combined_body = "\n\n---\n\n".join(note_parts)
+                try:
+                    create_note_from_body(combined_body, msg_type, i_contact_id, messages)
+                    notes_created += 1
+                except Exception as e:
+                    print(f"Error creating combined note for conv {conv.id}, type {msg_type}: {e}")
+                    processed += 1
+                    continue
+
+    print(f"Finished. Notes created: {notes_created}, Errors: {processed}")

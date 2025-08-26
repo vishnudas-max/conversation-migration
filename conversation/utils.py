@@ -1875,8 +1875,8 @@ def create_notes_for_messages():
 
     # Step 1: Get distinct conversations that have pending messages of those types
     conversations = (
-        conversation.objects.filter(i_messages__msg_type__in=msg_types,)
-        .distinct()[:1]
+        conversation.objects.filter(i_messages__msg_type__in=msg_types)
+        .distinct()
     )
 
     notes_created = 0

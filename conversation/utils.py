@@ -1596,7 +1596,7 @@ def map_conversations():
 
     inka_conv_ids = ['G76NJI1eCgAcmfi2a5MB']
 
-    conversations = conversation.objects.filter(i_conversation_id__in=inka_conv_ids).iterator()
+    conversations = conversation.objects.all().iterator()
     
     created = 0
     for conv in conversations:

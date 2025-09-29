@@ -264,13 +264,16 @@ def add_cercus_contacts_to_db(ghlcontacts, locationId):
         linked_inkadmin_obj = None
         if inkadmin_link_cfield_id:
             link_val = get_cf_value(c.get("customFields"), inkadmin_link_cfield_id)
-            if link_val in ["dowHfn4CLwNwGSdvgfwy","isWHRvVuR2bWvFiLdfpP","zwdLWeitH8mzNqLmXZD1","4fhHPQtoWJ5XR2ifhNsU","XP5vxJeM0cJ6YvKBYzTH","VpowxOprkIEFMiY1gVD0","6yOJ5ysFmjbNooz94yW7","LYFM9Tt6D4wqBNgoydGm"]:
-                print(f"cercus contact_id {contact_id} has suspicious link value {link_val}; skipping link")
             if link_val:
                 linked_inkadmin_obj = inkadmincontact.objects.filter(
                     contact_id=str(link_val)
                 ).first()
-
+        if not link_val:
+            print(f"count not get cfield value {contact_id}")
+            continue
+        if cercuscontact.objects.filter(inkadmin_contact=linked_inkadmin_obj).exclude(contact_id=contact_id).exists():
+            print(f"inkadmincontact {linked_inkadmin_obj} is already to linked to some other contact")
+            continue
         existing = existing_by_id.get(contact_id)
         if existing:
             existing.phone = phone
@@ -1591,9 +1594,9 @@ def save_inka_messages(i_conversation_id, inkmessages):
 def map_conversations():
     from .models import conversation
 
-    inka_conv_ids = []
+    inka_conv_ids = ['G76NJI1eCgAcmfi2a5MB']
 
-    conversations = conversation.objects.filter(c_messages__isnull=True,i_conversation_id__in=inka_conv_ids).iterator()
+    conversations = conversation.objects.filter(i_conversation_id__in=inka_conv_ids).iterator()
     
     created = 0
     for conv in conversations:
@@ -1630,15 +1633,15 @@ def map_conversations():
                                         "emil_msg_ids": email_msg_ids_obj,
                                     }
                                 )
-            
-            try:
-                create_message(
-                    msg,
-                    conv,
-                    imsg_obj
-                )
-            except Exception as e:
-                print(f"Error creating message for conversation {conv.i_conversation_id}: {e}")
+            if created:
+                try:
+                    create_message(
+                        msg,
+                        conv,
+                        imsg_obj
+                    )
+                except Exception as e:
+                    print(f"Error creating message for conversation {conv.i_conversation_id}: {e}")
 
 
         print(f"Migration completed for conversation {conv}")
@@ -1833,7 +1836,45 @@ def parse_date(date_str: str):
     return dt.strftime("%m-%d-%Y %H:%M:%S")
 
 
-def create_note_from_body(body, msgtype, i_contact_id, messages,note_id):
+def create_note_from_body(body, msgtype, i_contact_id, messages):
+    """Helper to create a new note for multiple messages of same conversation/type"""
+    i_contact_obj = inkadmincontact.objects.filter(contact_id=i_contact_id).first()
+    c_contact = getattr(i_contact_obj, "cercus_contacts", None)
+    c_contact_id = c_contact.contact_id if c_contact else None
+
+    if not c_contact_id:
+        raise Exception(f"{i_contact_id} has no mapped cercus contact")
+
+    payload = {"body": body}
+    url = f"https://services.leadconnectorhq.com/contacts/{c_contact_id}/notes"
+
+    header = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Version": settings.GHL_API_VERSION,
+        "Authorization": f"Bearer {settings.CERCUS_GHL_ACCESS_TOKEN}"
+    }
+
+    response = requests.post(url, json=payload, headers=header)
+    response.raise_for_status()
+    data = response.json().get("note", {})
+    nid = str(data.get("id"))
+
+    # Link this note to all included messages
+    for i_msg in messages:
+        Notes.objects.update_or_create(
+            note_id=nid,
+            i_message=i_msg,
+            defaults={
+                "contact": c_contact,
+                "note_type": msgtype
+            }
+        )
+
+    print(f"Created new note {nid}")
+    return nid
+
+def update_note_from_body(body, msgtype, i_contact_id, messages,note_id):
     """Helper to send one note for multiple messages of same conversation/type"""
     i_contact_obj = inkadmincontact.objects.filter(contact_id=i_contact_id).first()
     c_contact = getattr(i_contact_obj, "cercus_contacts", None)
@@ -1881,6 +1922,7 @@ def create_notes_for_messages():
 
     notes_created = 0
     processed = 0
+    notes_updated= 0
 
     for conv in conversations:
 
@@ -1903,8 +1945,7 @@ def create_notes_for_messages():
                 continue
             
             if not note_id:
-                print(f"Failed to get note_id to update messages from conversation {conv.i_conversation_id} for msg type{msg_type}")
-                continue
+                print(f"Could not find a note_id, will be creating a new note for this messages under conversation {conv.i_conversation_id}")
             note_parts = []
 
             if msg_type == "TYPE_INSTAGRAM":
@@ -1951,12 +1992,21 @@ def create_notes_for_messages():
             # Step 2: If we gathered any notes, join and create one single note
             if note_parts:
                 combined_body = "\n\n---\n\n".join(note_parts)
-                try:
-                    create_note_from_body(combined_body, msg_type, i_contact_id, messages,note_id)
-                    notes_created += 1
-                except Exception as e:
-                    print(f"Error creating combined note for conv {conv.id}, type {msg_type}: {e}")
-                    processed += 1
-                    continue
+                if note_id:
+                    try:
+                        update_note_from_body(combined_body, msg_type, i_contact_id, messages,note_id)
+                        notes_updated += 1
+                    except Exception as e:
+                        print(f"Error creating combined note for conv {conv.id}, type {msg_type}: {e}")
+                        processed += 1
+                        continue
+                else:
+                    try:
+                        create_note_from_body(combined_body, msg_type, i_contact_id, messages)
+                        notes_created += 1
+                    except Exception as e:
+                        print(f"Error creating combined note for conv {conv.id}, type {msg_type}: {e}")
+                        processed += 1
+                        continue
 
-    print(f"Finished. Notes created: {notes_created}, Errors: {processed}")
+    print(f"Finished. Notes Processed: {processed},:Created {notes_created} :Updated {notes_updated}")
